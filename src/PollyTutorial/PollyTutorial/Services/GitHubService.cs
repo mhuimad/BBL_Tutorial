@@ -1,58 +1,73 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.Linq;
 using System.Net.Http;
 using System.Threading.Tasks;
-using Newtonsoft.Json;
 using PollyTutorial.Dto;
 using PollyTutorial.Contracts;
+using Polly.Retry;
+using Polly;
+using Polly.Fallback;
 
 namespace PollyTutorial.Services
 {
     public class GitHubService : IGitHubService
     {
-        private readonly IHttpClientFactory _httpFactory;
         private static readonly Random Random = new Random();
-        private const int MaxRetries = 3;
+        private const int MaxRetries = 2;
+        private const string EXCEPTION_MESSAGE = "Fake request exception";
+        private const int ExceptionsAllowedBeforeBreaking = 15;
+        private const int DurationOfBreakInMinute = 5;
+        private readonly AsyncRetryPolicy _retryPolicy;
+        private readonly AsyncPolicy _circuitBreakderPolicy;
+        private readonly IGithubRepository _githubRepository;
 
-        public GitHubService(IHttpClientFactory httpFactory)
+        public GitHubService(IGithubRepository githubRepository)
         {
-            _httpFactory = httpFactory;
+            _retryPolicy = Policy.Handle<HttpRequestException>()
+                                       .WaitAndRetryAsync(MaxRetries, times => TimeSpan.FromMilliseconds(100 * times));
+            _circuitBreakderPolicy = Policy.Handle<Exception>()
+                .CircuitBreakerAsync(ExceptionsAllowedBeforeBreaking, TimeSpan.FromMinutes(DurationOfBreakInMinute));
+
+            _githubRepository = githubRepository;
+
         }
 
         public async Task<User> GetUserByUserNameAsync(string userName)
         {
-            var client = _httpFactory.CreateClient("GitHub");
-            var retriesLeft = MaxRetries;
-            User user = null;
-            while (retriesLeft > 0)
+            return await _retryPolicy.ExecuteAsync(async () =>
             {
-                try
-                {
-                    if (Random.Next(1, 3) == 1)
-                        throw new HttpRequestException("Fake request exception ");
+                if (Random.Next(1, 3) == 1)
+                    throw new HttpRequestException(EXCEPTION_MESSAGE);
+                return await _githubRepository.GetUserByUserNameAsync(userName);
+            });
 
-                    var result = await client.GetAsync($"/users/{userName}");
-                    if (result.StatusCode == System.Net.HttpStatusCode.NotFound)
-                        break;
-
-                    var resultString = await result.Content.ReadAsStringAsync();
-                    user = JsonConvert.DeserializeObject<User>(resultString);
-                    break;
-                }
-                catch (HttpRequestException)
-                {
-                    retriesLeft--;
-                    if (retriesLeft == 0)
-                        throw;
-                }
-
-
-            }
-
-            return user;
         }
 
+        public async Task<IEnumerable<User>> GetUsersByOrgAsync(string orgName)
+        {
+            return await _retryPolicy.ExecuteAsync(async () =>
+            {
+                return await _githubRepository.GetUsersByOrgAsync(orgName);
+            });
 
+        }
+
+        public async Task<bool> CreateUserAsync(User user)
+        {
+            var fallbackPolicy = Policy.Handle<Exception>().FallbackAsync(async (cancellationToken) => await SaveUserInQueueAsync(user));
+
+            var result = await fallbackPolicy
+                .WrapAsync(_retryPolicy)
+                .WrapAsync(_circuitBreakderPolicy)
+                .ExecuteAsync(async () => await _githubRepository.CreateUserAsync(user));
+
+            return result;
+        }
+
+        public async Task<bool> SaveUserInQueueAsync(User user)
+        {
+            await Task.CompletedTask;
+            return true;
+        }
     }
 }
